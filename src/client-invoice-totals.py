@@ -14,7 +14,7 @@ print("🐍 Starting client-invoice-totals.py...", flush=True)
 
 # ✅ Required ENV vars
 required_vars = [
-    "NEON_DATABASE_URL", "ODOO_URL", "ODOO_DB", "ODOO_LOGIN", "ODOO_API_KEY"
+    "NEON_DATABASE_URL", "ODOO_URL", "ODOO_DB", "ODOO_LOGIN", "ODOO_PASSWORD"
 ]
 missing = [var for var in required_vars if not os.getenv(var)]
 if missing:
@@ -42,7 +42,7 @@ except Exception as e:
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
 ODOO_LOGIN = os.getenv("ODOO_LOGIN")
-ODOO_API_KEY = os.getenv("ODOO_API_KEY")
+ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
 
 # 📡 Fetch totals from Neon
 def fetch_client_totals():
@@ -64,15 +64,15 @@ def fetch_client_totals():
         log(f"❌ Error fetching data from Neon: {e}")
         return []
 
-# 🔐 Authenticate to Odoo
+# 🔐 Authenticate to Odoo with login + password
 def authenticate_odoo():
-    log("🔐 Logging into Odoo...")
+    log("🔐 Logging into Odoo with user credentials...")
     try:
         resp = requests.post(f"{ODOO_URL}/web/session/authenticate", json={
             "params": {
                 "db": ODOO_DB,
                 "login": ODOO_LOGIN,
-                "password": ODOO_API_KEY
+                "password": ODOO_PASSWORD
             }
         }, headers={"Content-Type": "application/json"})
 
@@ -84,7 +84,7 @@ def authenticate_odoo():
         if session_id:
             log("✅ Logged into Odoo.")
         else:
-            log("❌ No session ID returned.")
+            log("❌ No session ID returned from Odoo.")
         return session_id
     except Exception as e:
         log(f"❌ Exception during Odoo login: {e}")
