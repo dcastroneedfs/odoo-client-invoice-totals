@@ -5,9 +5,9 @@ import time
 import urllib.parse as urlparse
 from datetime import datetime
 
-# Logging helper
-def log(message):
-    print(f"{datetime.now().isoformat()} | {message}")
+# Pretty logger
+def log(msg):
+    print(f"{datetime.now().isoformat()} | {msg}")
 
 # Load Odoo credentials from environment
 ODOO_URL = os.getenv("ODOO_URL")
@@ -28,10 +28,10 @@ db_conn_params = {
     "sslmode": "require"
 }
 
-# Step 1: Fetch invoice totals per vendor
+# 1. Fetch totals per client from Neon
 def fetch_client_totals():
     try:
-        log("Connecting to Neon DB...")
+        log("📡 Fetching invoice totals from Neon DB...")
         conn = psycopg2.connect(**db_conn_params)
         cur = conn.cursor()
         cur.execute("""
@@ -42,15 +42,15 @@ def fetch_client_totals():
         rows = cur.fetchall()
         cur.close()
         conn.close()
-        log(f"✅ Fetched {len(rows)} client totals from Neon.")
+        log(f"💰 Retrieved totals for {len(rows)} clients.")
         return rows
     except Exception as e:
         log(f"❌ Error fetching data from Neon: {e}")
         return []
 
-# Step 2: Authenticate with Odoo
+# 2. Authenticate with Odoo
 def authenticate_odoo():
-    log("🔐 Authenticating with Odoo...")
+    log("🔐 Logging into Odoo...")
     response = requests.post(f"{ODOO_URL}/web/session/authenticate", json={
         "params": {
             "db": ODOO_DB,
@@ -65,17 +65,23 @@ def authenticate_odoo():
 
     result = response.json().get("result", {})
     if result.get("session_id"):
-        log("✅ Authenticated with Odoo.")
+        log("✅ Logged into Odoo, beginning sync...")
     else:
         log("❌ No session ID returned.")
     return result.get("session_id")
 
-# Step 3: Push or update client data in Odoo
+# 3. Sync to Odoo
 def sync_to_odoo(client_data, session_id):
-    log("📡 Syncing to Odoo...")
-    updated, created = 0, 0
+    log("📤 Syncing client invoice totals to Odoo...")
+    created, updated = 0, 0
 
     for vendor_name, invoice_count, total_amount in client_data:
+        headers = {
+            "Content-Type": "application/json",
+            "Cookie": f"session_id={session_id}"
+        }
+
+        # Search for existing record
         search_payload = {
             "model": "x_ap_client_invoice_total",
             "method": "search_read",
@@ -84,11 +90,6 @@ def sync_to_odoo(client_data, session_id):
                 "domain": [["x_studio_client_name", "=", vendor_name]],
                 "fields": ["id"]
             }
-        }
-
-        headers = {
-            "Content-Type": "application/json",
-            "Cookie": f"session_id={session_id}"
         }
 
         search_resp = requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=search_payload, headers=headers)
@@ -121,16 +122,16 @@ def sync_to_odoo(client_data, session_id):
             requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=create_payload, headers=headers)
             created += 1
 
-    log(f"✅ Sync complete. Created: {created}, Updated: {updated}")
+    log(f"✅ Odoo sync complete! Created: {created} | Updated: {updated}")
 
-# Step 4: Loop every 60 seconds
+# 4. Run in loop
 if __name__ == "__main__":
     while True:
         log("🔁 Starting sync cycle...")
         session_id = authenticate_odoo()
         if session_id:
-            data = fetch_client_totals()
-            if data:
-                sync_to_odoo(data, session_id)
-        log("⏳ Waiting 60 seconds until next sync...\n")
+            totals = fetch_client_totals()
+            if totals:
+                sync_to_odoo(totals, session_id)
+        log("⏳ Sleeping for 60 seconds...\n")
         time.sleep(60)
