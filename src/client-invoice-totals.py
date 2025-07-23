@@ -1,5 +1,4 @@
 import requests
-import json
 from datetime import datetime
 
 ODOO_URL = "https://needfstrial.odoo.com"
@@ -12,8 +11,11 @@ def log(msg):
 
 def test_odoo_login():
     log("🔐 Testing Odoo login...")
+
     try:
-        resp = requests.post(f"{ODOO_URL}/web/session/authenticate", json={
+        session = requests.Session()
+
+        resp = session.post(f"{ODOO_URL}/web/session/authenticate", json={
             "params": {
                 "db": ODOO_DB,
                 "login": ODOO_LOGIN,
@@ -22,15 +24,14 @@ def test_odoo_login():
         }, headers={"Content-Type": "application/json"})
 
         log(f"📬 Response Status: {resp.status_code}")
-        log(f"📬 Response Body: {resp.text}")
-
         data = resp.json()
-        session_id = data.get("result", {}).get("session_id")
+
+        session_id = session.cookies.get("session_id")
 
         if session_id:
             log(f"✅ Success! Session ID: {session_id}")
         else:
-            log("❌ Login failed: No session ID returned.")
+            log("❌ Login failed: No session ID returned in cookies.")
     except Exception as e:
         log(f"❌ Exception during Odoo login: {e}")
 
