@@ -3,45 +3,67 @@ import time
 import logging
 import psycopg2
 import requests
+from urllib.parse import urlparse
 
-# === Logging Configuration ===
+# Configure logging
 logging.basicConfig(
-    level=logging.INFO,
     format='%(asctime)s | %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    level=logging.INFO
 )
 
-# === Load environment variables ===
+# ENV VARS REQUIRED
 NEON_DATABASE_URL = os.getenv("NEON_DATABASE_URL")
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
 ODOO_USERNAME = os.getenv("ODOO_USERNAME")
 ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
 
-required_vars = ["NEON_DATABASE_URL", "ODOO_URL", "ODOO_DB", "ODOO_USERNAME", "ODOO_PASSWORD"]
-for var in required_vars:
-    if not os.getenv(var):
-        logging.error(f"❌ Missing required env var: {var}")
-        exit(1)
+# Odoo model and field names
+ODOO_MODEL = "x_client_invoice_total"
+ODOO_FIELD_CLIENT = "x_studio_client_name"
+ODOO_FIELD_AMOUNT = "x_studio_total_invoice_amount"
 
-# === Odoo Login ===
-def odoo_login():
-    logging.info("🔐 Logging into Odoo...")
+if not all([NEON_DATABASE_URL, ODOO_URL, ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD]):
+    missing = [k for k in ["NEON_DATABASE_URL", "ODOO_URL", "ODOO_DB", "ODOO_USERNAME", "ODOO_PASSWORD"] if not os.getenv(k)]
+    logging.error(f"❌ Missing required environment variables: {', '.join(missing)}")
+    exit(1)
+
+# Connect to Neon DB and fetch invoice totals
+def fetch_invoice_totals():
     try:
-        response = requests.post(
-            f"{ODOO_URL}/web/session/authenticate",
-            json={
-                "jsonrpc": "2.0",
-                "params": {
-                    "db": ODOO_DB,
-                    "login": ODOO_USERNAME,
-                    "password": ODOO_PASSWORD
-                }
-            },
-            timeout=10
+        parsed = urlparse(NEON_DATABASE_URL)
+        conn = psycopg2.connect(
+            dbname=parsed.path.lstrip("/"),
+            user=parsed.username,
+            password=parsed.password,
+            host=parsed.hostname,
+            port=parsed.port,
+            sslmode="require"
         )
-        result = response.json()
-        if "result" in result and "session_id" in response.cookies:
+        cur = conn.cursor()
+        cur.execute("SELECT vendor, SUM(amount) FROM invoices GROUP BY vendor")
+        data = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [{"vendor": row[0], "total": float(row[1])} for row in data]
+    except Exception as e:
+        logging.error(f"❌ Error fetching invoice totals: {e}")
+        return []
+
+# Log in to Odoo and get session
+def odoo_login():
+    try:
+        login_payload = {
+            "jsonrpc": "2.0",
+            "method": "call",
+            "params": {
+                "db": ODOO_DB,
+                "login": ODOO_USERNAME,
+                "password": ODOO_PASSWORD
+            }
+        }
+        response = requests.post(f"{ODOO_URL}/web/session/authenticate", json=login_payload)
+        if response.status_code == 200 and response.json().get("result", {}).get("session_id"):
             session_id = response.cookies.get("session_id")
             logging.info("✅ Logged in to Odoo!")
             return session_id
@@ -53,71 +75,48 @@ def odoo_login():
         logging.error(f"❌ Exception during Odoo login: {e}")
         return None
 
-# === Get invoice totals from Neon ===
-def fetch_invoice_totals():
-    logging.info("📡 Fetching invoice totals from Neon DB...")
-    try:
-        conn = psycopg2.connect(NEON_DATABASE_URL)
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT vendor_name, SUM(invoice_amount)::numeric(10,2)
-            FROM invoices
-            GROUP BY vendor_name
-        """)
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        logging.info(f"📦 Retrieved {len(rows)} vendors.")
-        return rows
-    except Exception as e:
-        logging.error(f"❌ Error fetching from Neon DB: {e}")
-        return []
-
-# === Update Odoo custom model ===
-def update_odoo_totals(session_id, vendor_totals):
+# Send data to Odoo
+def send_to_odoo(session_id, vendor_data):
     headers = {
         "Content-Type": "application/json",
         "Cookie": f"session_id={session_id}"
     }
-    for vendor, total in vendor_totals:
-        logging.info(f"🚚 Syncing vendor: {vendor} | Total: ${total}")
+    for vendor in vendor_data:
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "call",
+            "params": {
+                "model": ODOO_MODEL,
+                "method": "create",
+                "args": [[
+                    {
+                        ODOO_FIELD_CLIENT: vendor["vendor"],
+                        ODOO_FIELD_AMOUNT: vendor["total"]
+                    }
+                ]],
+                "kwargs": {}
+            },
+            "id": 1
+        }
+        logging.info(f"🚚 Syncing vendor: {vendor['vendor']} | Total: ${vendor['total']:.2f}")
         try:
-            data = {
-                "jsonrpc": "2.0",
-                "method": "call",
-                "params": {
-                    "model": "x_ap_dashboard",
-                    "method": "create",
-                    "args": [{
-                        "x_client_name": vendor,
-                        "x_studio_float_field_44o_1j0pl01m9": float(total)
-                    }],
-                    "kwargs": {}
-                },
-                "id": 1
-            }
-            response = requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=data, headers=headers)
-            if response.ok and 'result' in response.json():
-                logging.info("✅ Successfully updated Odoo.")
-            else:
-                logging.warning(f"⚠️ Failed to update vendor {vendor}. Response: {response.text}")
+            response = requests.post(f"{ODOO_URL}/web/dataset/call_kw", headers=headers, json=payload)
+            if response.status_code != 200 or "error" in response.json():
+                logging.warning(f"⚠️ Failed to update vendor {vendor['vendor']}. Response: {response.text}")
         except Exception as e:
-            logging.error(f"❌ Error updating Odoo for vendor {vendor}: {e}")
+            logging.error(f"❌ Exception sending to Odoo: {e}")
 
-# === Main loop ===
+# Main sync loop
 def main():
     logging.info("🐍 Starting client-invoice-totals.py...")
     while True:
-        try:
-            logging.info("🔁 Starting sync cycle...")
-            session_id = odoo_login()
-            if session_id:
-                vendor_totals = fetch_invoice_totals()
-                update_odoo_totals(session_id, vendor_totals)
-            else:
-                logging.warning("⚠️ Skipping push. Login failed.")
-        except Exception as e:
-            logging.error(f"❌ Unhandled error: {e}")
+        logging.info("🔁 Starting sync cycle...")
+        session_id = odoo_login()
+        if session_id:
+            logging.info("📡 Fetching invoice totals from Neon DB...")
+            vendors = fetch_invoice_totals()
+            logging.info(f"📦 Retrieved {len(vendors)} vendors.")
+            send_to_odoo(session_id, vendors)
         logging.info("⏳ Sleeping for 60 seconds...")
         time.sleep(60)
 
