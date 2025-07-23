@@ -9,18 +9,23 @@ from datetime import datetime
 def log(msg):
     print(f"{datetime.now().isoformat()} | {msg}")
 
-# Load Odoo credentials from environment
+# 🔁 Basic startup check
+print("🐍 Script started")
+
+# 🔐 Load Odoo credentials from environment
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
 ODOO_LOGIN = os.getenv("ODOO_LOGIN")
 ODOO_API_KEY = os.getenv("ODOO_API_KEY")
 
-# Parse Neon DB URL
+# 🛠 Load Neon DB URL
 db_url = os.getenv("NEON_DATABASE_URL")
-result = urlparse.urlparse(db_url)
+print("✅ Loaded NEON_DATABASE_URL:", db_url)
 
+# Parse DB URL
+result = urlparse.urlparse(db_url)
 db_conn_params = {
-    "dbname": result.path[1:],
+    "dbname": result.path[1:],  # remove leading slash
     "user": result.username,
     "password": result.password,
     "host": result.hostname,
@@ -28,7 +33,7 @@ db_conn_params = {
     "sslmode": "require"
 }
 
-# 1. Fetch totals per client from Neon
+# 📡 Fetch totals per vendor
 def fetch_client_totals():
     try:
         log("📡 Fetching invoice totals from Neon DB...")
@@ -48,29 +53,33 @@ def fetch_client_totals():
         log(f"❌ Error fetching data from Neon: {e}")
         return []
 
-# 2. Authenticate with Odoo
+# 🔐 Authenticate with Odoo
 def authenticate_odoo():
     log("🔐 Logging into Odoo...")
-    response = requests.post(f"{ODOO_URL}/web/session/authenticate", json={
-        "params": {
-            "db": ODOO_DB,
-            "login": ODOO_LOGIN,
-            "password": ODOO_API_KEY
-        }
-    }, headers={"Content-Type": "application/json"})
+    try:
+        response = requests.post(f"{ODOO_URL}/web/session/authenticate", json={
+            "params": {
+                "db": ODOO_DB,
+                "login": ODOO_LOGIN,
+                "password": ODOO_API_KEY
+            }
+        }, headers={"Content-Type": "application/json"})
 
-    if response.status_code != 200:
-        log(f"❌ Odoo auth failed: {response.text}")
+        if response.status_code != 200:
+            log(f"❌ Odoo auth failed: {response.text}")
+            return None
+
+        result = response.json().get("result", {})
+        if result.get("session_id"):
+            log("✅ Logged into Odoo, beginning sync...")
+        else:
+            log("❌ No session ID returned.")
+        return result.get("session_id")
+    except Exception as e:
+        log(f"❌ Exception during Odoo auth: {e}")
         return None
 
-    result = response.json().get("result", {})
-    if result.get("session_id"):
-        log("✅ Logged into Odoo, beginning sync...")
-    else:
-        log("❌ No session ID returned.")
-    return result.get("session_id")
-
-# 3. Sync to Odoo
+# 📤 Push data into Odoo
 def sync_to_odoo(client_data, session_id):
     log("📤 Syncing client invoice totals to Odoo...")
     created, updated = 0, 0
@@ -92,39 +101,50 @@ def sync_to_odoo(client_data, session_id):
             }
         }
 
-        search_resp = requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=search_payload, headers=headers)
-        existing = search_resp.json().get("result")
+        try:
+            search_resp = requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=search_payload, headers=headers)
+            existing = search_resp.json().get("result")
 
-        if existing:
-            record_id = existing[0]["id"]
-            update_payload = {
-                "model": "x_ap_client_invoice_total",
-                "method": "write",
-                "args": [[record_id], {
-                    "x_studio_invoice_count": invoice_count,
-                    "x_studio_total_invoice_amount": total_amount
-                }],
-                "kwargs": {}
-            }
-            requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=update_payload, headers=headers)
-            updated += 1
-        else:
-            create_payload = {
-                "model": "x_ap_client_invoice_total",
-                "method": "create",
-                "args": [{
-                    "x_studio_client_name": vendor_name,
-                    "x_studio_invoice_count": invoice_count,
-                    "x_studio_total_invoice_amount": total_amount
-                }],
-                "kwargs": {}
-            }
-            requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=create_payload, headers=headers)
-            created += 1
+            if existing:
+                # Update existing
+                record_id = existing[0]["id"]
+                update_payload = {
+                    "model": "x_ap_client_invoice_total",
+                    "method": "write",
+                    "args": [[record_id], {
+                        "x_studio_invoice_count": invoice_count,
+                        "x_studio_total_invoice_amount": total_amount
+                    }],
+                    "kwargs": {}
+                }
+                resp = requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=update_payload, headers=headers)
+                if resp.status_code == 200:
+                    updated += 1
+                else:
+                    log(f"❌ Failed to update {vendor_name}: {resp.status_code} - {resp.text}")
+            else:
+                # Create new
+                create_payload = {
+                    "model": "x_ap_client_invoice_total",
+                    "method": "create",
+                    "args": [{
+                        "x_studio_client_name": vendor_name,
+                        "x_studio_invoice_count": invoice_count,
+                        "x_studio_total_invoice_amount": total_amount
+                    }],
+                    "kwargs": {}
+                }
+                resp = requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=create_payload, headers=headers)
+                if resp.status_code == 200:
+                    created += 1
+                else:
+                    log(f"❌ Failed to create {vendor_name}: {resp.status_code} - {resp.text}")
+        except Exception as e:
+            log(f"❌ Exception syncing {vendor_name}: {e}")
 
     log(f"✅ Odoo sync complete! Created: {created} | Updated: {updated}")
 
-# 4. Run in loop
+# 🔁 Loop every 60 seconds
 if __name__ == "__main__":
     while True:
         log("🔁 Starting sync cycle...")
