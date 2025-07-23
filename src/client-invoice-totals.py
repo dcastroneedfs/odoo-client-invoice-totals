@@ -3,15 +3,11 @@ import time
 import logging
 import requests
 import psycopg2
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 
-# Environment variables
+# Environment variables (set in Render Dashboard)
 NEON_DATABASE_URL = os.getenv("NEON_DATABASE_URL")
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
@@ -72,7 +68,7 @@ def upsert_invoice_record(session_id, client_name, total_amount):
 
     cookies = {"session_id": session_id}
 
-    # Check if record exists
+    # Search for existing record
     search_payload = {
         "jsonrpc": "2.0",
         "method": "call",
