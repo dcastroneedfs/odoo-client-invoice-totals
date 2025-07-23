@@ -4,36 +4,47 @@ import requests
 import time
 import urllib.parse as urlparse
 from datetime import datetime
+import sys
 
-# Pretty logger
 def log(msg):
     print(f"{datetime.now().isoformat()} | {msg}")
 
-# 🔁 Basic startup check
-print("🐍 Script started")
+# 🚦 Initial startup checks
+print("🐍 Script is starting...")
 
-# 🔐 Load Odoo credentials from environment
+# ✅ Validate environment variables
+required_vars = [
+    "ODOO_URL", "ODOO_DB", "ODOO_LOGIN", "ODOO_API_KEY", "NEON_DATABASE_URL"
+]
+missing = [var for var in required_vars if not os.getenv(var)]
+if missing:
+    print(f"❌ Missing required environment variables: {', '.join(missing)}")
+    sys.exit(1)
+
+# 🔌 Parse Neon connection string
+try:
+    db_url = os.getenv("NEON_DATABASE_URL")
+    print("✅ NEON_DATABASE_URL loaded successfully.")
+    result = urlparse.urlparse(db_url)
+    db_conn_params = {
+        "dbname": result.path[1:],
+        "user": result.username,
+        "password": result.password,
+        "host": result.hostname,
+        "port": result.port,
+        "sslmode": "require"
+    }
+except Exception as e:
+    print(f"❌ Failed to parse NEON_DATABASE_URL: {e}")
+    sys.exit(1)
+
+# 🔐 Load Odoo credentials
 ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
 ODOO_LOGIN = os.getenv("ODOO_LOGIN")
 ODOO_API_KEY = os.getenv("ODOO_API_KEY")
 
-# 🛠 Load Neon DB URL
-db_url = os.getenv("NEON_DATABASE_URL")
-print("✅ Loaded NEON_DATABASE_URL:", db_url)
-
-# Parse DB URL
-result = urlparse.urlparse(db_url)
-db_conn_params = {
-    "dbname": result.path[1:],  # remove leading slash
-    "user": result.username,
-    "password": result.password,
-    "host": result.hostname,
-    "port": result.port,
-    "sslmode": "require"
-}
-
-# 📡 Fetch totals per vendor
+# 📡 Fetch totals per vendor from Neon
 def fetch_client_totals():
     try:
         log("📡 Fetching invoice totals from Neon DB...")
@@ -66,20 +77,21 @@ def authenticate_odoo():
         }, headers={"Content-Type": "application/json"})
 
         if response.status_code != 200:
-            log(f"❌ Odoo auth failed: {response.text}")
+            log(f"❌ Odoo auth failed: {response.status_code} - {response.text}")
             return None
 
         result = response.json().get("result", {})
         if result.get("session_id"):
             log("✅ Logged into Odoo, beginning sync...")
+            return result.get("session_id")
         else:
-            log("❌ No session ID returned.")
-        return result.get("session_id")
+            log("❌ Odoo login succeeded but no session ID returned.")
+            return None
     except Exception as e:
         log(f"❌ Exception during Odoo auth: {e}")
         return None
 
-# 📤 Push data into Odoo
+# 📤 Sync client totals to Odoo
 def sync_to_odoo(client_data, session_id):
     log("📤 Syncing client invoice totals to Odoo...")
     created, updated = 0, 0
@@ -90,7 +102,6 @@ def sync_to_odoo(client_data, session_id):
             "Cookie": f"session_id={session_id}"
         }
 
-        # Search for existing record
         search_payload = {
             "model": "x_ap_client_invoice_total",
             "method": "search_read",
@@ -106,7 +117,6 @@ def sync_to_odoo(client_data, session_id):
             existing = search_resp.json().get("result")
 
             if existing:
-                # Update existing
                 record_id = existing[0]["id"]
                 update_payload = {
                     "model": "x_ap_client_invoice_total",
@@ -123,7 +133,6 @@ def sync_to_odoo(client_data, session_id):
                 else:
                     log(f"❌ Failed to update {vendor_name}: {resp.status_code} - {resp.text}")
             else:
-                # Create new
                 create_payload = {
                     "model": "x_ap_client_invoice_total",
                     "method": "create",
@@ -144,7 +153,7 @@ def sync_to_odoo(client_data, session_id):
 
     log(f"✅ Odoo sync complete! Created: {created} | Updated: {updated}")
 
-# 🔁 Loop every 60 seconds
+# 🔁 Run every 60 seconds
 if __name__ == "__main__":
     while True:
         log("🔁 Starting sync cycle...")
