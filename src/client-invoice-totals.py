@@ -72,6 +72,7 @@ def update_vendor_record(session_id, vendor_name, invoice_amount):
         "Cookie": f"session_id={session_id}"
     }
 
+    # Construct payload
     data = {
         "jsonrpc": "2.0",
         "method": "call",
@@ -79,13 +80,13 @@ def update_vendor_record(session_id, vendor_name, invoice_amount):
             "model": MODEL_NAME,
             "method": "create",
             "args": [{
-                "x_name": vendor_name,
-                FIELD_CLIENT_NAME: vendor_name,
-                FIELD_INVOICE_AMOUNT: float(invoice_amount)
+                "x_name": str(vendor_name),  # required 'Description' field
+                "x_studio_client_name": str(vendor_name),
+                "x_studio_total_invoice_amount": float(invoice_amount)
             }],
-            "kwargs": {},
+            "kwargs": {}
         },
-        "id": 1,
+        "id": 1
     }
 
     try:
@@ -97,6 +98,7 @@ def update_vendor_record(session_id, vendor_name, invoice_amount):
             logging.info(f"✅ Synced vendor: {vendor_name} | Invoice: ${invoice_amount}")
     except Exception as e:
         logging.error(f"❌ Exception syncing vendor {vendor_name}: {e}")
+
 
 
 def main():
