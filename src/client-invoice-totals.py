@@ -1,8 +1,9 @@
 import time
-print("🐍 Render worker script started successfully!")
+
+print("✅ Script is running!", flush=True)
 
 i = 0
 while True:
-    print(f"🟢 Heartbeat... {i}")
-    time.sleep(10)
+    print(f"🟢 Tick {i}", flush=True)
     i += 1
+    time.sleep(10)
