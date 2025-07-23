@@ -1,26 +1,85 @@
 import os
+import time
+import logging
 import psycopg2
 import requests
-import logging
-import time
 
-# Set up logging
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
 
-# Load environment variables from Render (do not hardcode)
+# Environment variables
 NEON_DB_URL = os.environ.get("NEON_DATABASE_URL")
 ODOO_URL = os.environ.get("ODOO_URL")
 ODOO_DB = os.environ.get("ODOO_DB")
 ODOO_USERNAME = os.environ.get("ODOO_USERNAME")
 ODOO_PASSWORD = os.environ.get("ODOO_PASSWORD")
 
-# Odoo model and fields
+# Odoo model + fields
 ODOO_MODEL = "x_client_invoice_total"
 ODOO_FIELDS = {
-    "name": "x_name",
+    "name": "x_name",  # Required: "Description"
     "client": "x_studio_client_name",
     "amount": "x_studio_total_invoice_amount"
 }
+
+# Use persistent session with cookies
+session = requests.Session()
+
+def login_to_odoo():
+    url = f"{ODOO_URL}/web/session/authenticate"
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "db": ODOO_DB,
+            "login": ODOO_USERNAME,
+            "password": ODOO_PASSWORD
+        },
+        "id": 1
+    }
+
+    try:
+        response = session.post(url, json=payload).json()
+        if "result" in response and response["result"].get("session_id"):
+            logging.info("✅ Logged in to Odoo!")
+            return True
+        else:
+            logging.error(f"❌ Login failed: {response}")
+            return False
+    except Exception as e:
+        logging.error(f"❌ Exception during login: {e}")
+        return False
+
+def call_odoo(method, model, args=None, kwargs=None):
+    url = f"{ODOO_URL}/web/dataset/call_kw"
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "model": model,
+            "method": method,
+            "args": args or [],
+            "kwargs": kwargs or {},
+        },
+        "id": 1
+    }
+
+    headers = {"Content-Type": "application/json"}
+    try:
+        res = session.post(url, json=payload, headers=headers)
+        return res.json()
+    except Exception as e:
+        logging.error(f"❌ Request error: {e}")
+        return {}
+
+def clear_existing_records():
+    response = call_odoo("search", ODOO_MODEL, args=[[]])
+    record_ids = response.get("result", [])
+    if record_ids:
+        call_odoo("unlink", ODOO_MODEL, args=[record_ids])
+        logging.info(f"🧹 Deleted {len(record_ids)} existing records.")
+    else:
+        logging.info("ℹ️ No existing records to delete.")
 
 def get_invoice_totals():
     try:
@@ -35,58 +94,15 @@ def get_invoice_totals():
         logging.error(f"❌ Database fetch error: {e}")
         return []
 
-def login_to_odoo():
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "call",
-        "params": {
-            "db": ODOO_DB,
-            "login": ODOO_USERNAME,
-            "password": ODOO_PASSWORD
-        },
-        "id": 1
-    }
-    try:
-        res = requests.post(f"{ODOO_URL}/web/session/authenticate", json=payload).json()
-        return res["result"]["session_id"]
-    except Exception as e:
-        logging.error(f"❌ Odoo login error: {e}")
-        return None
-
-def call_odoo(session_id, method, model, args=None, kwargs=None):
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "call",
-        "params": {
-            "model": model,
-            "method": method,
-            "args": args or [],
-            "kwargs": kwargs or {},
-        },
-        "id": 1
-    }
-    headers = {"Content-Type": "application/json", "X-Openerp-Session-Id": session_id}
-    response = requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=payload, headers=headers)
-    return response.json()
-
-def clear_existing_records(session_id):
-    response = call_odoo(session_id, "search", ODOO_MODEL, args=[[]])
-    record_ids = response.get("result", [])
-    if record_ids:
-        call_odoo(session_id, "unlink", ODOO_MODEL, args=[record_ids])
-        logging.info(f"🧹 Deleted {len(record_ids)} existing records.")
-    else:
-        logging.info("ℹ️ No existing records to delete.")
-
-def sync_to_odoo(session_id, records):
+def sync_to_odoo(records):
     for vendor_name, amount in records:
         logging.info(f"🚚 Syncing vendor: {vendor_name} | Total: ${amount:.2f}")
         payload = {
-            ODOO_FIELDS["name"]: vendor_name,  # Required "Description"
+            ODOO_FIELDS["name"]: vendor_name,  # Required field!
             ODOO_FIELDS["client"]: vendor_name,
             ODOO_FIELDS["amount"]: amount
         }
-        res = call_odoo(session_id, "create", ODOO_MODEL, args=[payload])
+        res = call_odoo("create", ODOO_MODEL, args=[payload])
         if "error" in res:
             logging.warning(f"⚠️ Failed to sync vendor {vendor_name}. Response: {res}")
         else:
@@ -96,22 +112,21 @@ if __name__ == "__main__":
     logging.info("🐍 Starting client-invoice-totals.py...")
     while True:
         logging.info("🔁 Starting sync cycle...")
-        session_id = login_to_odoo()
-        if not session_id:
+
+        if not login_to_odoo():
             time.sleep(60)
             continue
 
-        logging.info("✅ Logged in to Odoo!")
-        clear_existing_records(session_id)
+        clear_existing_records()
 
         logging.info("📡 Fetching invoice totals from Neon DB...")
-        vendor_totals = get_invoice_totals()
+        records = get_invoice_totals()
 
-        if vendor_totals:
-            logging.info(f"📦 Retrieved {len(vendor_totals)} vendors.")
-            sync_to_odoo(session_id, vendor_totals)
+        if records:
+            logging.info(f"📦 Retrieved {len(records)} vendors.")
+            sync_to_odoo(records)
         else:
-            logging.info("⚠️ No data found in Neon DB.")
+            logging.info("⚠️ No data found.")
 
         logging.info("⏳ Sleeping for 60 seconds...")
         time.sleep(60)
