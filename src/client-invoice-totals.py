@@ -1,59 +1,100 @@
-from datetime import datetime
-import requests
-import logging
 import os
+import time
+import logging
+import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from datetime import datetime
 
-# Setup logger
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
-log = logging.info
+# ──────────────────────────────
+# 📋 Logging Setup
+# ──────────────────────────────
+logging.basicConfig(
+    format="%(asctime)s | %(message)s",
+    level=logging.INFO,
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
-# ENV variables
-NEON_API_URL = os.getenv("NEON_API_URL", "https://mock.neon.tech/api/invoices")
-ODOO_URL = os.getenv("ODOO_URL", "https://needfstrial.odoo.com")
-ODOO_MODEL = "x_client_invoice_total"
-ODOO_VENDOR_FIELD = "x_studio_client_name"
-ODOO_AMOUNT_FIELD = "x_studio_total_invoice_amount"
-ODOO_USERNAME = os.getenv("ODOO_USERNAME", "dcastro@needfs.com")
-ODOO_PASSWORD = os.getenv("ODOO_PASSWORD", "admin12345678#")
-ODOO_DB = os.getenv("ODOO_DB", "needfstrial")
+# ──────────────────────────────
+# 🔐 Load Environment Variables
+# ──────────────────────────────
+NEON_DB_URL = os.getenv("NEON_DATABASE_URL")
+ODOO_URL = os.getenv("ODOO_URL")
+ODOO_DB = os.getenv("ODOO_DB")
+ODOO_USERNAME = os.getenv("ODOO_USERNAME")
+ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
+ODOO_MODEL = os.getenv("ODOO_MODEL", "x_ap_dashboard")
+ODOO_VENDOR_FIELD = os.getenv("ODOO_VENDOR_FIELD", "x_vendor_name")
+ODOO_TOTAL_FIELD = os.getenv("ODOO_TOTAL_FIELD", "x_invoice_total")
 
-def get_invoice_totals():
-    log("📡 Fetching invoice totals from Neon API...")
-    response = requests.get(NEON_API_URL)
-    if response.status_code == 200:
-        data = response.json()
-        client_totals = {}
-        for invoice in data:
-            client = invoice.get("client_name", "").strip()
-            amount = float(invoice.get("amount", 0))
-            if client:
-                client_totals[client] = client_totals.get(client, 0) + amount
-        log(f"📦 Parsed client totals: {client_totals}")
-        return client_totals
-    else:
-        raise Exception(f"Failed to fetch data: {response.status_code} {response.text}")
+if not NEON_DB_URL:
+    logging.error("❌ NEON_DATABASE_URL is not set.")
+    exit(1)
 
-def odoo_login():
-    log("🔐 Logging into Odoo with user credentials...")
-    session = requests.Session()
-    payload = {
-        "jsonrpc": "2.0",
-        "params": {
-            "db": ODOO_DB,
-            "login": ODOO_USERNAME,
-            "password": ODOO_PASSWORD
-        }
+# ──────────────────────────────
+# 🐘 Fetch invoice totals per vendor
+# ──────────────────────────────
+def fetch_invoice_totals():
+    logging.info("📡 Fetching invoice totals from Neon DB...")
+    try:
+        conn = psycopg2.connect(NEON_DB_URL, cursor_factory=RealDictCursor)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT vendor_name, SUM(invoice_amount) AS total_invoice_amount
+            FROM invoices
+            GROUP BY vendor_name
+        """)
+        rows = cur.fetchall()
+        conn.close()
+        logging.info(f"📦 Retrieved {len(rows)} vendors.")
+        return rows
+    except Exception as e:
+        logging.error(f"❌ Failed to fetch from Neon DB: {e}")
+        return []
+
+# ──────────────────────────────
+# 🔐 Login to Odoo and get session cookie
+# ──────────────────────────────
+def login_to_odoo():
+    logging.info("🔐 Logging into Odoo...")
+    try:
+        response = requests.post(
+            f"{ODOO_URL}/web/session/authenticate",
+            json={
+                "jsonrpc": "2.0",
+                "params": {
+                    "db": ODOO_DB,
+                    "login": ODOO_USERNAME,
+                    "password": ODOO_PASSWORD,
+                },
+            },
+            headers={"Content-Type": "application/json"}
+        )
+        if response.status_code == 200:
+            session_id = response.cookies.get("session_id")
+            if session_id:
+                logging.info("✅ Odoo login successful. Session established.")
+                return session_id
+        logging.error(f"❌ Odoo login failed. Status: {response.status_code}")
+        logging.error(f"❌ Response: {response.text}")
+    except Exception as e:
+        logging.error(f"❌ Exception during login: {e}")
+    return None
+
+# ──────────────────────────────
+# 🚀 Push data to Odoo
+# ──────────────────────────────
+def push_to_odoo(session_id, vendor_data):
+    headers = {
+        "Content-Type": "application/json",
+        "Cookie": f"session_id={session_id}"
     }
-    response = session.post(f"{ODOO_URL}/web/session/authenticate", json=payload)
-    data = response.json()
-    if "result" in data and "session_id" in session.cookies:
-        log(f"✅ Success! Session ID: {session.cookies['session_id']}")
-        return session
-    else:
-        raise Exception(f"❌ Login failed: {data}")
+    url = f"{ODOO_URL}/jsonrpc"
 
-def push_totals_to_odoo(session, totals):
-    for client, amount in totals.items():
+    for row in vendor_data:
+        vendor = row["vendor_name"]
+        total = row["total_invoice_amount"]
+
         payload = {
             "jsonrpc": "2.0",
             "method": "call",
@@ -61,45 +102,41 @@ def push_totals_to_odoo(session, totals):
                 "model": ODOO_MODEL,
                 "method": "create",
                 "args": [{
-                    ODOO_VENDOR_FIELD: client,
-                    ODOO_AMOUNT_FIELD: amount,
+                    ODOO_VENDOR_FIELD: vendor,
+                    ODOO_TOTAL_FIELD: total
                 }],
                 "kwargs": {},
             },
-            "id": datetime.now().isoformat()
+            "id": datetime.utcnow().timestamp()
         }
-        response = session.post(f"{ODOO_URL}/jsonrpc", json=payload)
-        if response.status_code == 200 and "result" in response.json():
-            log(f"📤 Pushed {client}: ${amount}")
-        else:
-            log(f"❌ Failed to push {client}: {response.status_code} {response.text}")
 
-def debug_read_back_records(session):
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "call",
-        "params": {
-            "model": ODOO_MODEL,
-            "method": "search_read",
-            "args": [[], ["id", ODOO_VENDOR_FIELD, ODOO_AMOUNT_FIELD]],
-        },
-        "id": 99
-    }
-    response = session.post(f"{ODOO_URL}/jsonrpc", json=payload)
-    data = response.json()
-    log("🧾 Records currently in Odoo:")
-    for rec in data.get("result", []):
-        log(f"   ➤ ID {rec['id']}: {rec[ODOO_VENDOR_FIELD]} - ${rec[ODOO_AMOUNT_FIELD]}")
+        try:
+            response = requests.post(url, json=payload, headers=headers)
+            if response.status_code == 200:
+                logging.info(f"✅ Pushed: {vendor} | ${total:,.2f}")
+            else:
+                logging.error(f"❌ Failed to push {vendor}. Status {response.status_code}")
+        except Exception as e:
+            logging.error(f"❌ Exception pushing {vendor}: {e}")
 
-def main():
-    try:
-        log("🐍 Starting client-invoice-totals.py...")
-        totals = get_invoice_totals()
-        session = odoo_login()
-        push_totals_to_odoo(session, totals)
-        debug_read_back_records(session)
-    except Exception as e:
-        log(f"❌ Error: {e}")
-
+# ──────────────────────────────
+# 🔁 Loop
+# ──────────────────────────────
 if __name__ == "__main__":
-    main()
+    logging.info("🐍 Starting client-invoice-totals.py...")
+
+    while True:
+        logging.info("🔁 Starting sync cycle...")
+
+        data = fetch_invoice_totals()
+        if not data:
+            logging.warning("⚠️ No data to sync.")
+        else:
+            session = login_to_odoo()
+            if session:
+                push_to_odoo(session, data)
+            else:
+                logging.warning("⚠️ Skipping push. Login failed.")
+
+        logging.info("⏳ Sleeping for 60 seconds...\n")
+        time.sleep(60)
