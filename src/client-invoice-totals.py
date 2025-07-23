@@ -2,7 +2,7 @@ import requests
 import json
 from datetime import datetime
 
-ODOO_URL = "https://needfs.odoo.com"
+ODOO_URL = "https://needfstrial.odoo.com"
 ODOO_DB = "needfstrial"
 ODOO_LOGIN = "dcastro@needfs.com"
 ODOO_PASSWORD = "admin12345678#"
