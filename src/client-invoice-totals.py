@@ -3,6 +3,11 @@ import psycopg2
 import requests
 import time
 import urllib.parse as urlparse
+from datetime import datetime
+
+# Logging helper
+def log(message):
+    print(f"{datetime.now().isoformat()} | {message}")
 
 # Load Odoo credentials from environment
 ODOO_URL = os.getenv("ODOO_URL")
@@ -10,12 +15,12 @@ ODOO_DB = os.getenv("ODOO_DB")
 ODOO_LOGIN = os.getenv("ODOO_LOGIN")
 ODOO_API_KEY = os.getenv("ODOO_API_KEY")
 
-# Parse Neon DB URL from full connection string
+# Parse Neon DB URL
 db_url = os.getenv("NEON_DATABASE_URL")
 result = urlparse.urlparse(db_url)
 
 db_conn_params = {
-    "dbname": result.path[1:],  # remove leading slash
+    "dbname": result.path[1:],
     "user": result.username,
     "password": result.password,
     "host": result.hostname,
@@ -23,9 +28,10 @@ db_conn_params = {
     "sslmode": "require"
 }
 
-# Step 1: Fetch invoice totals per vendor from Neon DB
+# Step 1: Fetch invoice totals per vendor
 def fetch_client_totals():
     try:
+        log("Connecting to Neon DB...")
         conn = psycopg2.connect(**db_conn_params)
         cur = conn.cursor()
         cur.execute("""
@@ -36,13 +42,15 @@ def fetch_client_totals():
         rows = cur.fetchall()
         cur.close()
         conn.close()
+        log(f"✅ Fetched {len(rows)} client totals from Neon.")
         return rows
     except Exception as e:
-        print(f"❌ Error connecting to Neon: {e}")
+        log(f"❌ Error fetching data from Neon: {e}")
         return []
 
-# Step 2: Authenticate with Odoo using API key
+# Step 2: Authenticate with Odoo
 def authenticate_odoo():
+    log("🔐 Authenticating with Odoo...")
     response = requests.post(f"{ODOO_URL}/web/session/authenticate", json={
         "params": {
             "db": ODOO_DB,
@@ -52,16 +60,22 @@ def authenticate_odoo():
     }, headers={"Content-Type": "application/json"})
 
     if response.status_code != 200:
-        print(f"❌ Odoo auth failed: {response.text}")
+        log(f"❌ Odoo auth failed: {response.text}")
         return None
 
     result = response.json().get("result", {})
+    if result.get("session_id"):
+        log("✅ Authenticated with Odoo.")
+    else:
+        log("❌ No session ID returned.")
     return result.get("session_id")
 
-# Step 3: Push or update each vendor's totals into Odoo Studio model
+# Step 3: Push or update client data in Odoo
 def sync_to_odoo(client_data, session_id):
+    log("📡 Syncing to Odoo...")
+    updated, created = 0, 0
+
     for vendor_name, invoice_count, total_amount in client_data:
-        # Prepare search request to find existing vendor record
         search_payload = {
             "model": "x_ap_client_invoice_total",
             "method": "search_read",
@@ -81,7 +95,6 @@ def sync_to_odoo(client_data, session_id):
         existing = search_resp.json().get("result")
 
         if existing:
-            # Update existing record
             record_id = existing[0]["id"]
             update_payload = {
                 "model": "x_ap_client_invoice_total",
@@ -93,8 +106,8 @@ def sync_to_odoo(client_data, session_id):
                 "kwargs": {}
             }
             requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=update_payload, headers=headers)
+            updated += 1
         else:
-            # Create new record
             create_payload = {
                 "model": "x_ap_client_invoice_total",
                 "method": "create",
@@ -106,16 +119,18 @@ def sync_to_odoo(client_data, session_id):
                 "kwargs": {}
             }
             requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=create_payload, headers=headers)
+            created += 1
 
-    print("✅ Sync complete.")
+    log(f"✅ Sync complete. Created: {created}, Updated: {updated}")
 
-# Step 4: Run every 60 seconds in a loop
+# Step 4: Loop every 60 seconds
 if __name__ == "__main__":
     while True:
-        print("🔁 Running sync to Odoo...")
+        log("🔁 Starting sync cycle...")
         session_id = authenticate_odoo()
         if session_id:
             data = fetch_client_totals()
             if data:
                 sync_to_odoo(data, session_id)
+        log("⏳ Waiting 60 seconds until next sync...\n")
         time.sleep(60)
