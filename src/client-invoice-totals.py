@@ -12,131 +12,227 @@ from datetime import datetime
 logging.basicConfig(
     format="%(asctime)s | %(message)s",
     level=logging.INFO,
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
+log = logging.info
+log_err = logging.error
+log_warn = logging.warning
 
 # ──────────────────────────────
-# 🔐 Load Environment Variables
+# 🔐 Load & sanitize env vars
 # ──────────────────────────────
-NEON_DB_URL = os.getenv("NEON_DATABASE_URL")
-ODOO_URL = os.getenv("ODOO_URL")
-ODOO_DB = os.getenv("ODOO_DB")
-ODOO_USERNAME = os.getenv("ODOO_USERNAME")
-ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
-ODOO_MODEL = os.getenv("ODOO_MODEL", "x_ap_dashboard")
-ODOO_VENDOR_FIELD = os.getenv("ODOO_VENDOR_FIELD", "x_vendor_name")
-ODOO_TOTAL_FIELD = os.getenv("ODOO_TOTAL_FIELD", "x_invoice_total")
+def _env(name, default=None, required=False):
+    v = os.getenv(name, default)
+    if v is not None:
+        v = v.strip()
+    if required and not v:
+        log_err(f"❌ Missing required env var: {name}")
+        raise SystemExit(1)
+    return v
 
-if not NEON_DB_URL:
-    logging.error("❌ NEON_DATABASE_URL is not set.")
-    exit(1)
+NEON_DATABASE_URL = _env("NEON_DATABASE_URL", required=True)
+ODOO_URL          = _env("ODOO_URL", required=True)              # e.g. https://needfstrial.odoo.com
+ODOO_DB           = _env("ODOO_DB", required=True)               # e.g. needfstrial
+ODOO_USERNAME     = _env("ODOO_USERNAME", required=True)
+ODOO_PASSWORD     = _env("ODOO_PASSWORD", required=True)
+ODOO_MODEL        = _env("ODOO_MODEL", "x_client_invoice_total")
+ODOO_VENDOR_FIELD = _env("ODOO_VENDOR_FIELD", "x_studio_client_name")
+ODOO_TOTAL_FIELD  = _env("ODOO_TOTAL_FIELD", "x_studio_total_invoice_amount")
+ODOO_COUNT_FIELD  = _env("ODOO_COUNT_FIELD", "x_studio_invoice_count")  # optional; used if present
 
 # ──────────────────────────────
-# 🐘 Fetch invoice totals per vendor
+# 🐘 Fetch invoice totals per vendor from Neon DB
 # ──────────────────────────────
 def fetch_invoice_totals():
-    logging.info("📡 Fetching invoice totals from Neon DB...")
+    log("📡 Fetching invoice totals from Neon DB...")
+    rows = []
     try:
-        conn = psycopg2.connect(NEON_DB_URL, cursor_factory=RealDictCursor)
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT vendor_name, SUM(invoice_amount) AS total_invoice_amount
-            FROM invoices
-            GROUP BY vendor_name
-        """)
-        rows = cur.fetchall()
+        conn = psycopg2.connect(NEON_DATABASE_URL, cursor_factory=RealDictCursor)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT vendor_name,
+                           COUNT(*) AS invoice_count,
+                           SUM(invoice_amount) AS total_invoice_amount
+                    FROM invoices
+                    GROUP BY vendor_name
+                    ORDER BY vendor_name;
+                """)
+                rows = cur.fetchall()
         conn.close()
-        logging.info(f"📦 Retrieved {len(rows)} vendors.")
-        return rows
+        log(f"📦 Retrieved {len(rows)} vendors.")
     except Exception as e:
-        logging.error(f"❌ Failed to fetch from Neon DB: {e}")
-        return []
+        log_err(f"❌ Failed to fetch from Neon DB: {e}")
+    return rows
 
 # ──────────────────────────────
-# 🔐 Login to Odoo and get session cookie
+# 🔐 Login to Odoo and return a Session (cookie-based)
 # ──────────────────────────────
 def login_to_odoo():
-    logging.info("🔐 Logging into Odoo...")
+    log(f"🔐 Logging into Odoo... (db={ODOO_DB})")
+    session = requests.Session()
     try:
-        response = requests.post(
+        resp = session.post(
             f"{ODOO_URL}/web/session/authenticate",
             json={
-                "jsonrpc": "2.0",
                 "params": {
                     "db": ODOO_DB,
                     "login": ODOO_USERNAME,
                     "password": ODOO_PASSWORD,
-                },
+                }
             },
-            headers={"Content-Type": "application/json"}
+            headers={"Content-Type": "application/json"},
+            timeout=30,
         )
-        if response.status_code == 200:
-            session_id = response.cookies.get("session_id")
-            if session_id:
-                logging.info("✅ Odoo login successful. Session established.")
-                return session_id
-        logging.error(f"❌ Odoo login failed. Status: {response.status_code}")
-        logging.error(f"❌ Response: {response.text}")
     except Exception as e:
-        logging.error(f"❌ Exception during login: {e}")
-    return None
+        log_err(f"❌ Exception during Odoo login request: {e}")
+        return None
+
+    # Some failures still return 200 status; check content
+    if resp.status_code != 200:
+        log_err(f"❌ Odoo login HTTP failure: {resp.status_code} {resp.text}")
+        return None
+
+    # try JSON parse
+    try:
+        data = resp.json()
+    except Exception as e:
+        log_err(f"❌ Could not parse Odoo login JSON: {e} | body={resp.text}")
+        return None
+
+    # Extract session cookie
+    session_id = session.cookies.get("session_id")
+    if not session_id:
+        # See if error in body
+        err = data.get("error")
+        if err:
+            log_err(f"❌ Odoo login error: {err}")
+        else:
+            log_err("❌ Odoo login failed: no session_id cookie returned.")
+        return None
+
+    log(f"✅ Odoo login succeeded. session_id={session_id}")
+    return session
 
 # ──────────────────────────────
-# 🚀 Push data to Odoo
+# 🔍 Upsert record (search by vendor; update if exists else create)
 # ──────────────────────────────
-def push_to_odoo(session_id, vendor_data):
-    headers = {
-        "Content-Type": "application/json",
-        "Cookie": f"session_id={session_id}"
-    }
+def upsert_vendor_record(session, vendor_name, total_amount, invoice_count):
+    headers = {"Content-Type": "application/json"}
     url = f"{ODOO_URL}/jsonrpc"
 
-    for row in vendor_data:
-        vendor = row["vendor_name"]
-        total = row["total_invoice_amount"]
+    # 1. search_read for existing vendor
+    search_payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "model": ODOO_MODEL,
+            "method": "search_read",
+            "args": [[ [ODOO_VENDOR_FIELD, "=", vendor_name] ],
+                     ["id", ODOO_VENDOR_FIELD, ODOO_TOTAL_FIELD, ODOO_COUNT_FIELD]],
+            "kwargs": {"limit": 1},
+        },
+        "id": 1,
+    }
+    try:
+        search_resp = session.post(url, json=search_payload, headers=headers, timeout=30)
+        search_json = search_resp.json()
+        existing = search_json.get("result", [])
+    except Exception as e:
+        log_err(f"❌ search_read error for vendor '{vendor_name}': {e}")
+        return
 
-        payload = {
+    if existing:
+        # update
+        rec_id = existing[0]["id"]
+        update_vals = {
+            ODOO_TOTAL_FIELD: total_amount,
+        }
+        if ODOO_COUNT_FIELD:
+            update_vals[ODOO_COUNT_FIELD] = invoice_count
+
+        update_payload = {
+            "jsonrpc": "2.0",
+            "method": "call",
+            "params": {
+                "model": ODOO_MODEL,
+                "method": "write",
+                "args": [[rec_id], update_vals],
+                "kwargs": {},
+            },
+            "id": 2,
+        }
+        try:
+            update_resp = session.post(url, json=update_payload, headers=headers, timeout=30)
+            if update_resp.status_code == 200 and update_resp.json().get("result"):
+                log(f"🔁 Updated vendor '{vendor_name}' | total=${total_amount:,.2f} count={invoice_count}")
+            else:
+                log_err(f"❌ Failed to update '{vendor_name}': {update_resp.text}")
+        except Exception as e:
+            log_err(f"❌ Exception updating '{vendor_name}': {e}")
+    else:
+        # create
+        create_vals = {
+            ODOO_VENDOR_FIELD: vendor_name,
+            ODOO_TOTAL_FIELD: total_amount,
+        }
+        if ODOO_COUNT_FIELD:
+            create_vals[ODOO_COUNT_FIELD] = invoice_count
+
+        create_payload = {
             "jsonrpc": "2.0",
             "method": "call",
             "params": {
                 "model": ODOO_MODEL,
                 "method": "create",
-                "args": [{
-                    ODOO_VENDOR_FIELD: vendor,
-                    ODOO_TOTAL_FIELD: total
-                }],
+                "args": [create_vals],
                 "kwargs": {},
             },
-            "id": datetime.utcnow().timestamp()
+            "id": 3,
         }
-
         try:
-            response = requests.post(url, json=payload, headers=headers)
-            if response.status_code == 200:
-                logging.info(f"✅ Pushed: {vendor} | ${total:,.2f}")
+            create_resp = session.post(url, json=create_payload, headers=headers, timeout=30)
+            if create_resp.status_code == 200 and create_resp.json().get("result"):
+                log(f"➕ Created vendor '{vendor_name}' | total=${total_amount:,.2f} count={invoice_count}")
             else:
-                logging.error(f"❌ Failed to push {vendor}. Status {response.status_code}")
+                log_err(f"❌ Failed to create '{vendor_name}': {create_resp.text}")
         except Exception as e:
-            logging.error(f"❌ Exception pushing {vendor}: {e}")
+            log_err(f"❌ Exception creating '{vendor_name}': {e}")
 
 # ──────────────────────────────
-# 🔁 Loop
+# 📦 Read back a few records for verification
+# ──────────────────────────────
+def debug_read_back_records(session, limit=10):
+    headers = {"Content-Type": "application/json"}
+    url = f"{ODOO_URL}/jsonrpc"
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "model": ODOO_MODEL,
+            "method": "search_read",
+            "args": [[], ["id", ODOO_VENDOR_FIELD, ODOO_TOTAL_FIELD, ODOO_COUNT_FIELD]],
+            "kwargs": {"limit": limit},
+        },
+        "id": 99,
+    }
+    try:
+        resp = session.post(url, json=payload, headers=headers, timeout=30)
+        data = resp.json()
+        records = data.get("result", [])
+        log(f"🧾 {len(records)} records currently in Odoo ({ODOO_MODEL}):")
+        for rec in records:
+            vendor = rec.get(ODOO_VENDOR_FIELD)
+            total = rec.get(ODOO_TOTAL_FIELD)
+            count = rec.get(ODOO_COUNT_FIELD)
+            log(f"   • {vendor} | total=${total} | count={count}")
+    except Exception as e:
+        log_err(f"❌ debug_read_back_records error: {e}")
+
+# ──────────────────────────────
+# 🔁 Main loop
 # ──────────────────────────────
 if __name__ == "__main__":
-    logging.info("🐍 Starting client-invoice-totals.py...")
-
+    log("🐍 Starting client-invoice-totals.py...")
     while True:
-        logging.info("🔁 Starting sync cycle...")
-
-        data = fetch_invoice_totals()
-        if not data:
-            logging.warning("⚠️ No data to sync.")
-        else:
-            session = login_to_odoo()
-            if session:
-                push_to_odoo(session, data)
-            else:
-                logging.warning("⚠️ Skipping push. Login failed.")
-
-        logging.info("⏳ Sleeping for 60 seconds...\n")
-        time.sleep(60)
+        log("🔁 Starting sync cycle...
