@@ -1,105 +1,131 @@
 import os
-import psycopg2
-import xmlrpc.client
+import time
 import logging
+import psycopg2
+import requests
 
-# Logging setup
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
-# Odoo credentials
-ODOO_URL = 'https://your-odoo-instance.odoo.com'
-ODOO_DB = 'your-odoo-db-name'
-ODOO_USERNAME = 'your@email.com'
-ODOO_PASSWORD = 'your-password'
+# Env vars from Render
+DB_URL = os.getenv("NEON_DATABASE_URL")
+ODOO_URL = os.getenv("ODOO_URL")
+ODOO_DB = os.getenv("ODOO_DB")
+ODOO_USERNAME = os.getenv("ODOO_USERNAME")
+ODOO_PASSWORD = os.getenv("ODOO_PASSWORD")
+MODEL_NAME = "x_client_invoice_total"
 
-# Neon DB connection string (environment variable)
-DATABASE_URL = os.getenv("NEON_DATABASE_URL")
-
-def fetch_vendor_totals():
-    """Connects to Neon and returns vendor totals as a list of (vendor, total)"""
-    if not DATABASE_URL:
-        logging.error("❌ NEON_DATABASE_URL environment variable not set.")
-        return []
-
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        cur = conn.cursor()
-        logging.info("📡 Fetching invoice totals from Neon DB...")
-
-        cur.execute("""
-            SELECT vendor_name, SUM(invoice_amount)
-            FROM vendor_invoices
-            GROUP BY vendor_name
-        """)
-        results = cur.fetchall()
-        logging.info(f"📦 Retrieved {len(results)} vendors.")
-
-        cur.close()
-        conn.close()
-        return results
-    except Exception as e:
-        logging.error(f"❌ Error fetching from Neon: {e}")
-        return []
-
-def login_odoo():
-    """Authenticates and returns uid, models"""
-    try:
-        logging.info("🔐 Logging into Odoo...")
-        common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common")
-        uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
-        if not uid:
-            raise Exception("Login failed. Check credentials.")
-        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+# Login to Odoo and return session ID + cookies
+def login_to_odoo():
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "db": ODOO_DB,
+            "login": ODOO_USERNAME,
+            "password": ODOO_PASSWORD
+        },
+        "id": 1
+    }
+    response = requests.post(f"{ODOO_URL}/web/session/authenticate", json=payload)
+    result = response.json()
+    if "result" in result:
+        session_id = response.cookies.get("session_id")
         logging.info("✅ Logged in to Odoo!")
-        return uid, models
-    except Exception as e:
-        logging.error(f"❌ Login failed: {e}")
+        return session_id, response.cookies
+    else:
+        logging.error(f"❌ Odoo login failed: {result}")
         return None, None
 
-def clear_ap_dashboard(models, uid):
-    """Deletes all rows from x_ap_dashboard"""
+# Delete all existing records in the model
+def clear_odoo_records(session_id, cookies):
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "model": MODEL_NAME,
+            "method": "search",
+            "args": [[]],
+        },
+        "id": 1
+    }
+    res = requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=payload, cookies=cookies)
+    ids = res.json().get("result", [])
+    if ids:
+        delete_payload = {
+            "jsonrpc": "2.0",
+            "method": "call",
+            "params": {
+                "model": MODEL_NAME,
+                "method": "unlink",
+                "args": [ids],
+            },
+            "id": 2
+        }
+        del_res = requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=delete_payload, cookies=cookies)
+        logging.info(f"🗑️ Deleted {len(ids)} existing records.")
+    else:
+        logging.info("ℹ️ No existing records to delete.")
+
+# Fetch vendors and invoice totals from Neon
+def fetch_invoice_totals():
     try:
-        logging.info("🧹 Clearing old dashboard entries...")
-        deleted = models.execute_kw(
-            ODOO_DB, uid, ODOO_PASSWORD,
-            'x_ap_dashboard', 'unlink',
-            [[['id', '!=', False]]]
-        )
-        logging.info(f"✅ Old entries removed: {deleted}")
+        conn = psycopg2.connect(DB_URL)
+        cursor = conn.cursor()
+        cursor.execute("SELECT vendor_name, invoice_amount FROM client_invoice_totals")
+        rows = cursor.fetchall()
+        conn.close()
+        logging.info(f"📦 Retrieved {len(rows)} vendors.")
+        return rows
     except Exception as e:
-        logging.error(f"❌ Error clearing dashboard: {e}")
+        logging.error(f"❌ Database fetch error: {e}")
+        return []
 
-def push_totals(models, uid, vendor_totals):
-    """Push vendor totals into Odoo"""
-    for vendor, total in vendor_totals:
-        try:
-            logging.info(f"🚚 Syncing vendor: {vendor} | Total: ${float(total):,.2f}")
-            models.execute_kw(
-                ODOO_DB, uid, ODOO_PASSWORD,
-                'x_ap_dashboard', 'create',
-                [{
-                    'name': vendor,
-                    'x_studio_float_field_44o_1j0pl01m9': float(total)
-                }]
-            )
-            logging.info(f"✅ Synced vendor: {vendor} | Invoice: ${float(total):,.2f}")
-        except Exception as e:
-            logging.error(f"❌ Error syncing {vendor}: {e}")
+# Create new record in Odoo
+def create_odoo_record(vendor_name, invoice_amount, session_id, cookies):
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "model": MODEL_NAME,
+            "method": "create",
+            "args": [{
+                "x_studio_client_name": vendor_name,
+                "x_studio_total_invoice_amount": invoice_amount,
+                "x_name": vendor_name  # Required field
+            }],
+        },
+        "id": 3
+    }
+    response = requests.post(f"{ODOO_URL}/web/dataset/call_kw", json=payload, cookies=cookies)
+    if response.status_code == 200 and "result" in response.json():
+        logging.info(f"✅ Synced vendor: {vendor_name} | Invoice: ${invoice_amount}")
+    else:
+        logging.warning(f"⚠️ Failed to sync {vendor_name}. Response: {response.text}")
 
-def main():
-    vendor_totals = fetch_vendor_totals()
-    if not vendor_totals:
-        logging.warning("⚠️ No vendor totals found. Exiting.")
-        return
+# Main sync loop
+def run_sync():
+    logging.info("🐍 Starting client-invoice-totals.py...")
+    while True:
+        logging.info("🔁 Starting sync cycle...")
+        session_id, cookies = login_to_odoo()
+        if not session_id:
+            logging.error("❌ Aborting sync due to failed login.")
+            time.sleep(60)
+            continue
 
-    uid, models = login_odoo()
-    if not uid or not models:
-        return
+        clear_odoo_records(session_id, cookies)
+        vendor_rows = fetch_invoice_totals()
+        for vendor_name, invoice_amount in vendor_rows:
+            logging.info(f"🚚 Syncing vendor: {vendor_name} | Total: ${invoice_amount}")
+            create_odoo_record(vendor_name, float(invoice_amount), session_id, cookies)
 
-    clear_ap_dashboard(models, uid)
-    push_totals(models, uid, vendor_totals)
-
-    logging.info("🎉 Sync complete.")
+        logging.info("⏳ Sleeping for 60 seconds...\n")
+        time.sleep(60)
 
 if __name__ == "__main__":
-    main()
+    run_sync()
