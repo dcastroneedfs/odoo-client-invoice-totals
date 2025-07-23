@@ -235,4 +235,4 @@ def debug_read_back_records(session, limit=10):
 if __name__ == "__main__":
     log("🐍 Starting client-invoice-totals.py...")
     while True:
-        log("🔁 Starting sync cycle...
+        log("🔁 Starting sync cycle...")
