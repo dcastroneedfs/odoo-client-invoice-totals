@@ -2,7 +2,6 @@ import os
 import psycopg2
 import xmlrpc.client
 import logging
-from decimal import Decimal
 
 # Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s')
@@ -13,11 +12,15 @@ ODOO_DB = 'your-odoo-db-name'
 ODOO_USERNAME = 'your@email.com'
 ODOO_PASSWORD = 'your-password'
 
-# PostgreSQL (Neon) connection string
-DATABASE_URL = os.getenv("DATABASE_URL")  # or hardcode for testing
+# Neon DB connection string (environment variable)
+DATABASE_URL = os.getenv("NEON_DATABASE_URL")
 
 def fetch_vendor_totals():
     """Connects to Neon and returns vendor totals as a list of (vendor, total)"""
+    if not DATABASE_URL:
+        logging.error("❌ NEON_DATABASE_URL environment variable not set.")
+        return []
+
     try:
         conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
